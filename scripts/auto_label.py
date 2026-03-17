@@ -1,46 +1,74 @@
 #!/usr/bin/env python3
 """Automatic dataset labeling with SAM3/DART.
 
-Labels images with user-provided class names and saves results as YOLO
-format .txt files. Uses TRT FP16 backbone + 16-class enc-dec with
-presence tokens for fast inference. Automatically builds TRT engines
-if they are not found.
+Labels images with user-provided class names and saves results in YOLO
+or COCO format. Uses TRT FP16 backbone + 16-class enc-dec with presence
+tokens for fast inference. Automatically builds TRT engines if not found.
 
-YOLO format (one line per detection):
-    class_id  x_center  y_center  width  height
-All coordinates are normalized to [0, 1].
+Options:
+  --images-dir PATH       Directory of images or a single image file.
+  --classes NAME [NAME..] Class names to detect. Order determines class IDs
+                          (0-indexed). Any text prompt works (open-vocabulary).
+  --checkpoint PATH       SAM3 checkpoint. Pass sam3.pt to auto-download.
+  --output-dir, -o PATH   Where to write labels. Default: labels/ next to images.
+  --format {yolo,coco}    Output format (default: yolo).
+      yolo: One .txt per image. Each line: class_id x_center y_center w h
+            (normalized to [0,1]). Plus classes.txt for the index mapping.
+      coco: Single annotations.json with images, annotations, categories.
+            Bounding boxes in absolute [x, y, w, h] pixels.
+  --confidence FLOAT      Minimum detection confidence (default: 0.3).
+  --nms FLOAT             Per-class NMS IoU threshold (default: 0.7).
+  --merge-nms GROUPS      Cross-class NMS for overlapping similar classes.
+                          Suppresses duplicate boxes between classes that
+                          describe the same object (e.g. car vs truck).
+                          Format: semicolon-separated groups of comma-separated
+                          class names. Classes not in any group keep independent
+                          per-class NMS.
+                            "car,truck,bus"             one merge group
+                            "car,truck,bus;cat,dog"     two merge groups
+                            "all"                       merge everything
+  --merge-nms-thresh FLOAT  IoU threshold for cross-class merge NMS
+                          (default: 0.5). Typically stricter than --nms since
+                          cross-class overlaps are more likely to be duplicates.
+  --imgsz INT             Input resolution, must be divisible by 14
+                          (default: 1008). Lower values (644, 868) are faster
+                          but less accurate.
+  --trt-backbone PATH     Pre-built backbone TRT engine. If omitted, the
+                          engine is built automatically on first run (~5 min).
+  --trt-enc-dec PATH      Pre-built encoder-decoder TRT engine. If omitted,
+                          built automatically on first run (~3 min).
 
 Usage:
-    # Label a directory of images
+    # Label a directory of images (YOLO format)
     PYTHONIOENCODING=utf-8 python scripts/auto_label.py \
         --images-dir /path/to/images \
         --classes person car bicycle dog \
         --checkpoint sam3.pt
 
-    # Custom output directory and confidence threshold
+    # COCO format output to a specific folder
     PYTHONIOENCODING=utf-8 python scripts/auto_label.py \
         --images-dir /path/to/images \
         --classes person car bicycle dog \
-        --checkpoint sam3.pt \
-        --output-dir /path/to/labels \
-        --confidence 0.4
+        --checkpoint sam3.pt --format coco -o /path/to/output
 
-    # Use existing TRT engines (skip auto-build)
+    # Merge NMS for vehicle classes, keep others independent
+    PYTHONIOENCODING=utf-8 python scripts/auto_label.py \
+        --images-dir /path/to/images \
+        --classes person car truck bus bicycle \
+        --checkpoint sam3.pt \
+        --merge-nms "car,truck,bus"
+
+    # Use existing TRT engines
     PYTHONIOENCODING=utf-8 python scripts/auto_label.py \
         --images-dir /path/to/images \
         --classes person car bicycle dog \
         --checkpoint sam3.pt \
         --trt-backbone hf_backbone_1008_fp16.engine \
         --trt-enc-dec enc_dec_1008_c16_presence_fp16_opt5.engine
-
-    # Label a single image
-    PYTHONIOENCODING=utf-8 python scripts/auto_label.py \
-        --images-dir photo.jpg \
-        --classes person car bicycle dog \
-        --checkpoint sam3.pt
 """
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -49,6 +77,7 @@ from pathlib import Path
 
 import torch
 from PIL import Image
+from torchvision.ops import nms as torchvision_nms
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -230,30 +259,115 @@ def build_enc_dec_engine(checkpoint_path, imgsz, max_classes=16):
     return engine_path
 
 
+def parse_merge_groups(merge_spec, class_names):
+    """Parse --merge-nms spec into a list of class-id sets.
+
+    Args:
+        merge_spec: "all" or semicolon-separated groups like "car,truck,bus;cat,dog"
+        class_names: Ordered list of class names.
+
+    Returns:
+        List of sets, each containing class indices that share NMS.
+        Classes not in any group are left independent (no cross-class NMS).
+    """
+    name_to_id = {name: i for i, name in enumerate(class_names)}
+
+    if merge_spec.strip().lower() == "all":
+        return [set(range(len(class_names)))]
+
+    groups = []
+    for group_str in merge_spec.split(";"):
+        group_str = group_str.strip()
+        if not group_str:
+            continue
+        names = [n.strip() for n in group_str.split(",") if n.strip()]
+        ids = set()
+        for name in names:
+            if name not in name_to_id:
+                print(f"ERROR: Unknown class '{name}' in --merge-nms")
+                print(f"  Available classes: {class_names}")
+                sys.exit(1)
+            ids.add(name_to_id[name])
+        if len(ids) >= 2:
+            groups.append(ids)
+        elif len(ids) == 1:
+            print(f"WARNING: Merge group '{group_str}' has only one class, skipping.")
+
+    return groups
+
+
+def apply_merge_nms(results, merge_groups, nms_threshold):
+    """Apply cross-class NMS within each merge group.
+
+    For each merge group, run NMS on the union of all detections from those
+    classes. Detections from classes not in any group are kept as-is.
+    """
+    boxes = results["boxes"]       # (N, 4) xyxy
+    scores = results["scores"]     # (N,)
+    class_ids = results["class_ids"]  # (N,)
+    class_names = results["class_names"]  # list of N strings
+
+    if len(scores) == 0:
+        return results
+
+    # Track which detections to keep
+    keep_mask = torch.ones(len(scores), dtype=torch.bool, device=scores.device)
+
+    # Find which detections belong to any merge group
+    merged_ids = set()
+    for group in merge_groups:
+        merged_ids.update(group)
+
+    for group in merge_groups:
+        # Select detections belonging to this group
+        in_group = torch.tensor(
+            [int(class_ids[i].item()) in group for i in range(len(class_ids))],
+            dtype=torch.bool, device=scores.device,
+        )
+        if in_group.sum() < 2:
+            continue
+
+        group_indices = torch.where(in_group)[0]
+        group_boxes = boxes[group_indices]
+        group_scores = scores[group_indices]
+
+        # Run class-agnostic NMS within this group
+        nms_keep = torchvision_nms(group_boxes, group_scores, nms_threshold)
+        suppressed = torch.ones(len(group_indices), dtype=torch.bool, device=scores.device)
+        suppressed[nms_keep] = False
+        # Mark suppressed detections
+        keep_mask[group_indices[suppressed]] = False
+
+    # Filter results
+    keep_idx = torch.where(keep_mask)[0]
+    return {
+        "boxes": boxes[keep_idx],
+        "scores": scores[keep_idx],
+        "class_ids": class_ids[keep_idx],
+        "class_names": [class_names[i] for i in keep_idx.cpu().tolist()],
+    }
+
+
 def results_to_yolo(results, img_width, img_height):
     """Convert detection results to YOLO format lines.
 
     YOLO format: class_id x_center y_center width height
     All values normalized to [0, 1].
-
-    Returns list of strings, one per detection.
     """
     lines = []
-    boxes = results["boxes"]  # (N, 4) in xyxy format
-    class_ids = results["class_ids"]  # (N,)
-    scores = results["scores"]  # (N,)
+    boxes = results["boxes"]
+    class_ids = results["class_ids"]
+    scores = results["scores"]
 
     for i in range(len(scores)):
         x1, y1, x2, y2 = boxes[i].cpu().tolist()
         cls_id = int(class_ids[i].item())
 
-        # Convert xyxy to YOLO xywh normalized
         x_center = (x1 + x2) / 2.0 / img_width
         y_center = (y1 + y2) / 2.0 / img_height
         w = (x2 - x1) / img_width
         h = (y2 - y1) / img_height
 
-        # Clamp to [0, 1]
         x_center = max(0.0, min(1.0, x_center))
         y_center = max(0.0, min(1.0, y_center))
         w = max(0.0, min(1.0, w))
@@ -264,6 +378,33 @@ def results_to_yolo(results, img_width, img_height):
     return lines
 
 
+def results_to_coco_anns(results, image_id, ann_id_start):
+    """Convert detection results to COCO annotation dicts.
+
+    Returns list of COCO annotation dicts and the next available ann_id.
+    """
+    anns = []
+    boxes = results["boxes"]
+    class_ids = results["class_ids"]
+    scores = results["scores"]
+
+    for i in range(len(scores)):
+        x1, y1, x2, y2 = boxes[i].cpu().tolist()
+        w = x2 - x1
+        h = y2 - y1
+        anns.append({
+            "id": ann_id_start + i,
+            "image_id": image_id,
+            "category_id": int(class_ids[i].item()),
+            "bbox": [round(x1, 2), round(y1, 2), round(w, 2), round(h, 2)],
+            "area": round(w * h, 2),
+            "score": round(float(scores[i].item()), 4),
+            "iscrowd": 0,
+        })
+
+    return anns, ann_id_start + len(scores)
+
+
 @torch.inference_mode()
 def run_labeling(args):
     """Main labeling loop."""
@@ -272,11 +413,9 @@ def run_labeling(args):
         print("WARNING: No CUDA GPU detected. Inference will be very slow.")
         print("  TRT engines require a CUDA GPU. Falling back to PyTorch CPU.")
 
-    # Find images
     images = find_images(args.images_dir)
     print(f"Found {len(images)} images to label")
 
-    # Check checkpoint
     check_checkpoint(args.checkpoint)
 
     # Resolve TRT engines
@@ -299,6 +438,16 @@ def run_labeling(args):
             print(f"  Remove --trt-enc-dec to auto-build, or provide a valid path.")
             sys.exit(1)
 
+    # Parse merge groups
+    classes = args.classes
+    merge_groups = []
+    if args.merge_nms:
+        merge_groups = parse_merge_groups(args.merge_nms, classes)
+        group_strs = []
+        for g in merge_groups:
+            group_strs.append("{" + ", ".join(classes[i] for i in sorted(g)) + "}")
+        print(f"Merge NMS groups: {', '.join(group_strs)}")
+
     # Load model
     print(f"\nLoading SAM3 model from {args.checkpoint} ...")
     from sam3.model_builder import build_sam3_image_model
@@ -306,7 +455,6 @@ def run_labeling(args):
         device=device, checkpoint_path=args.checkpoint, eval_mode=True,
     )
 
-    # Create predictor
     from sam3.model.sam3_multiclass_fast import Sam3MultiClassPredictorFast
     predictor = Sam3MultiClassPredictorFast(
         model, device=device,
@@ -318,8 +466,6 @@ def run_labeling(args):
         trt_max_classes=16,
     )
 
-    # Set classes
-    classes = args.classes
     print(f"Classes ({len(classes)}): {classes}")
     if len(classes) > 16:
         print(f"NOTE: {len(classes)} classes > 16. Enc-dec will run in batches of 16.")
@@ -336,22 +482,31 @@ def run_labeling(args):
     # Setup output directory
     output_dir = Path(args.output_dir) if args.output_dir else None
     if output_dir is None:
-        # Default: labels/ subdirectory next to images
         if Path(args.images_dir).is_dir():
             output_dir = Path(args.images_dir).parent / "labels"
         else:
             output_dir = Path(args.images_dir).parent / "labels"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write classes.txt
+    # Write classes.txt (useful for both formats)
     classes_file = output_dir / "classes.txt"
     classes_file.write_text("\n".join(classes) + "\n")
     print(f"Class list saved to {classes_file}")
 
+    is_coco = args.format == "coco"
+
+    # COCO format state
+    coco_images = []
+    coco_annotations = []
+    ann_id = 1
+
     # Label images
-    print(f"\nLabeling {len(images)} images -> {output_dir}/")
+    fmt_label = "COCO" if is_coco else "YOLO"
+    print(f"\nLabeling {len(images)} images -> {output_dir}/ ({fmt_label} format)")
     print(f"  Confidence threshold: {args.confidence}")
     print(f"  NMS threshold: {args.nms}")
+    if merge_groups:
+        print(f"  Merge NMS threshold: {args.merge_nms_thresh}")
     print()
 
     total_dets = 0
@@ -368,19 +523,47 @@ def run_labeling(args):
             nms_threshold=args.nms,
         )
 
+        # Apply merge NMS if requested
+        if merge_groups and len(results["scores"]) > 0:
+            results = apply_merge_nms(results, merge_groups, args.merge_nms_thresh)
+
         n_dets = len(results["scores"])
         total_dets += n_dets
 
-        # Convert to YOLO format and save
-        yolo_lines = results_to_yolo(results, img_w, img_h)
-        label_path = output_dir / (img_path.stem + ".txt")
-        label_path.write_text("\n".join(yolo_lines) + "\n" if yolo_lines else "")
+        if is_coco:
+            image_id = idx + 1
+            coco_images.append({
+                "id": image_id,
+                "file_name": img_path.name,
+                "width": img_w,
+                "height": img_h,
+            })
+            anns, ann_id = results_to_coco_anns(results, image_id, ann_id)
+            coco_annotations.extend(anns)
+        else:
+            yolo_lines = results_to_yolo(results, img_w, img_h)
+            label_path = output_dir / (img_path.stem + ".txt")
+            label_path.write_text("\n".join(yolo_lines) + "\n" if yolo_lines else "")
 
         if (idx + 1) % 50 == 0 or idx == 0 or idx == len(images) - 1:
             elapsed = time.perf_counter() - t_start
             fps = (idx + 1) / elapsed if elapsed > 0 else 0
             print(f"  [{idx+1}/{len(images)}] {img_path.name}: "
                   f"{n_dets} dets, {fps:.1f} img/s")
+
+    # Save COCO JSON
+    if is_coco:
+        coco_output = {
+            "images": coco_images,
+            "annotations": coco_annotations,
+            "categories": [
+                {"id": i, "name": name} for i, name in enumerate(classes)
+            ],
+        }
+        coco_path = output_dir / "annotations.json"
+        with open(coco_path, "w") as f:
+            json.dump(coco_output, f, indent=2)
+        print(f"\n  COCO annotations saved to {coco_path}")
 
     elapsed = time.perf_counter() - t_start
     fps = len(images) / elapsed if elapsed > 0 else 0
@@ -394,31 +577,39 @@ def run_labeling(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Auto-label images with SAM3/DART in YOLO format",
+        description="Auto-label images with SAM3/DART",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Label a folder of images
+  # Label a folder (YOLO format, default)
   PYTHONIOENCODING=utf-8 python scripts/auto_label.py \\
       --images-dir /path/to/images --classes person car dog \\
       --checkpoint sam3.pt
 
-  # Label with custom confidence
+  # COCO format
   PYTHONIOENCODING=utf-8 python scripts/auto_label.py \\
       --images-dir /path/to/images --classes person car dog \\
-      --checkpoint sam3.pt --confidence 0.4
+      --checkpoint sam3.pt --format coco --output-dir /path/to/output
 
-  # Use pre-built TRT engines
+  # Merge NMS for similar classes
   PYTHONIOENCODING=utf-8 python scripts/auto_label.py \\
-      --images-dir /path/to/images --classes person car dog \\
+      --images-dir /path/to/images \\
+      --classes person car truck bus bicycle motorcycle \\
       --checkpoint sam3.pt \\
-      --trt-backbone hf_backbone_1008_fp16.engine \\
-      --trt-enc-dec enc_dec_1008_c16_presence_fp16_opt5.engine
+      --merge-nms "car,truck,bus;bicycle,motorcycle"
 
-Output:
-  Creates one .txt file per image in YOLO format:
-    class_id  x_center  y_center  width  height
-  Plus a classes.txt mapping class indices to names.
+  # Merge all classes (fully class-agnostic NMS)
+  PYTHONIOENCODING=utf-8 python scripts/auto_label.py \\
+      --images-dir /path/to/images --classes person car dog \\
+      --checkpoint sam3.pt --merge-nms all
+
+Output (YOLO):
+  One .txt per image:  class_id  x_center  y_center  width  height
+  Plus classes.txt mapping indices to names.
+
+Output (COCO):
+  Single annotations.json with images, annotations, categories.
+  Bounding boxes in absolute [x, y, w, h] format.
         """,
     )
     parser.add_argument(
@@ -434,8 +625,12 @@ Output:
         help="SAM3 checkpoint path (default: auto-download sam3.pt)",
     )
     parser.add_argument(
-        "--output-dir", type=str, default=None,
-        help="Output directory for label .txt files (default: labels/ next to images)",
+        "--output-dir", "-o", type=str, default=None,
+        help="Output directory for labels (default: labels/ next to images)",
+    )
+    parser.add_argument(
+        "--format", type=str, default="yolo", choices=["yolo", "coco"],
+        help="Label format: yolo (per-image .txt) or coco (single .json)",
     )
     parser.add_argument(
         "--confidence", type=float, default=0.3,
@@ -443,7 +638,16 @@ Output:
     )
     parser.add_argument(
         "--nms", type=float, default=0.7,
-        help="NMS IoU threshold (default: 0.7)",
+        help="Per-class NMS IoU threshold (default: 0.7)",
+    )
+    parser.add_argument(
+        "--merge-nms", type=str, default=None, metavar="GROUPS",
+        help='Cross-class NMS groups. Use "all" for fully class-agnostic, '
+             'or semicolon-separated groups: "car,truck,bus;cat,dog"',
+    )
+    parser.add_argument(
+        "--merge-nms-thresh", type=float, default=0.5,
+        help="IoU threshold for cross-class merge NMS (default: 0.5)",
     )
     parser.add_argument(
         "--imgsz", type=int, default=1008,
