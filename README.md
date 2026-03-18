@@ -38,22 +38,23 @@ Tested on Windows 11, RTX 4080 16 GB. All commands use bash syntax.
 | Python | 3.11+ |
 | torch | 2.7.0+ (CUDA 12.6+) |
 | torchvision | 0.22.0+ |
-| tensorrt | 10.9.0+ |
-| onnx | 1.20.1 |
-| numpy | 1.26.4 |
+| tensorrt | 10.9.0+ (optional, for TRT export) |
+| numpy | < 2.0 |
 
 ```bash
-# Core
+# 1. Install PyTorch with CUDA
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
-pip install tensorrt onnx onnxsim scipy opencv-python numpy
 
-# SAM3 (this repo)
+# 2. Install TensorRT (optional — only needed for TRT engine export/inference)
+pip install tensorrt
+
+# 3. Install DART (installs all other dependencies automatically)
 pip install -e .
-
-# For COCO evaluation
-pip install pycocotools   # Linux/Mac
-pip install pycocotools-windows   # Windows
 ```
+
+> **Windows note:** Always prefix Python commands with `PYTHONIOENCODING=utf-8`
+> on Windows. TRT, torch, and the detection scripts print Unicode characters
+> that the default Windows console encoding (cp1252) cannot handle.
 
 ### Files needed
 
@@ -706,13 +707,20 @@ python scripts/bisect_blocks_fp32.py --onnx backbone.onnx --checkpoint sam3.pt
 
 ### `PYTHONIOENCODING=utf-8`
 
-TRT and torch print emoji characters that Windows cp1252 can't encode. Always
-set `PYTHONIOENCODING=utf-8` on Windows.
+TRT, torch, and the detection scripts print Unicode characters (arrows, emoji)
+that the default Windows console encoding (cp1252) can't encode. Always set
+`PYTHONIOENCODING=utf-8` on Windows for **all** scripts, not just export scripts.
 
 ### torch.compile warmup takes 60–120 s
 
 Expected for `max-autotune` (Triton autotuning). Use `--compile default` for
 faster startup (~80 ms backbone, no autotuning). Warmup happens once per process.
+
+### torch.compile fails with "Compiler: cl is not found"
+
+`torch.compile` requires MSVC (`cl.exe`) on Windows. Install the
+"Desktop development with C++" workload from Visual Studio Build Tools, or
+use TRT engines instead (recommended for production speed).
 
 ### `AssertionError: num_classes=N exceeds max_classes=M`
 
@@ -732,10 +740,11 @@ Reduce `--max-classes` (4 → ~4 GB, 8 → ~8 GB). Close other GPU processes.
 FP16 accumulation issue. Use the HF export path (`export_hf_backbone.py`).
 See [FP16 Precision Analysis](#fp16-precision-analysis).
 
-### Engine not portable across GPUs
+### Engine not portable across GPUs or TRT versions
 
-TRT engines are GPU-specific. ONNX files are portable — rebuild the engine
-on the target GPU.
+TRT engines are specific to both the GPU architecture and the TensorRT version
+they were built with. ONNX files are portable — rebuild the engine on the
+target GPU or after upgrading TensorRT.
 
 ### External ONNX data files
 

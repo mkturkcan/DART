@@ -1,0 +1,138 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dart-detect"
+dynamic = ["version"]
+description = "DART: Detect Anything in Real Time — training-free framework that converts SAM3 into a real-time multi-class open-vocabulary detector"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {file = "LICENSE"}
+authors = [
+    {name = "Mehmet Kerem Turkcan"}
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.7.0",
+    "torchvision>=0.22.0",
+    "numpy>=1.26,<2",
+    "scipy",
+    "opencv-python",
+    "pillow",
+    "onnx>=1.20.1",
+    "onnxslim",
+    "tqdm",
+    "ftfy==6.1.1",
+    "regex",
+    "iopath>=0.1.10",
+    "typing_extensions",
+    "huggingface_hub",
+    "timm>=1.0.17",
+    "safetensors",
+    "transformers",
+    "einops",
+    "pycocotools",
+    "decord",
+    "psutil",
+    "triton-windows; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+tensorrt = [
+    "tensorrt>=10.9.0",
+    "onnx_graphsurgeon",
+    "polygraphy",
+]
+eval = [
+    "scikit-image",
+    "scikit-learn",
+]
+notebooks = [
+    "matplotlib",
+    "jupyter",
+    "notebook",
+    "ipywidgets",
+    "ipycanvas",
+    "ipympl",
+    "scikit-image",
+    "scikit-learn",
+]
+train = [
+    "hydra-core",
+    "submitit",
+    "tensorboard",
+    "torchmetrics",
+    "fvcore",
+    "fairscale",
+    "scikit-image",
+    "scikit-learn",
+]
+dev = [
+    "pytest",
+    "pytest-cov",
+]
+
+[project.urls]
+"Homepage" = "https://huggingface.co/mehmetkeremturkcan/DART"
+
+[tool.setuptools.packages.find]
+include = ["sam3*"]
+exclude = ["build*", "scripts*"]
+
+[tool.setuptools.package-data]
+sam3 = ["assets/*.txt.gz"]
+
+[tool.setuptools.dynamic]
+version = {attr = "sam3.__version__"}
+
+[tool.black]
+line-length = 88
+target-version = ['py311', 'py312']
+include = '\.pyi?$'
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = [
+    "torch.*",
+    "torchvision.*",
+    "timm.*",
+    "numpy.*",
+    "PIL.*",
+    "tqdm.*",
+    "ftfy.*",
+    "regex.*",
+    "iopath.*",
+    "tensorrt.*",
+    "onnx.*",
+    "onnxslim.*",
+    "scipy.*",
+    "cv2.*",
+    "einops.*",
+    "decord.*",
+    "psutil.*",
+    "pycocotools.*",
+    "triton.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
