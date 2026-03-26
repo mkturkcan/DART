@@ -76,7 +76,63 @@ pip install -e .
 
 ## Quick Start
 
-### Minimal: detect objects in an image
+Three backbone options from high quality to high speed. All start from
+`sam3.pt` (auto-downloads on first run) and share the same encoder-decoder
+engine.
+
+### Step 1: Build the shared encoder-decoder engine (one-time)
+
+```bash
+python -m sam3.trt.export_enc_dec --checkpoint sam3.pt \
+    --output enc_dec.onnx --max-classes 4 --imgsz 1008
+python -m sam3.trt.build_engine --onnx enc_dec.onnx \
+    --output enc_dec_fp16.engine --fp16 --mixed-precision none
+```
+
+### Step 2: Build a backbone engine
+
+Pick one (or build all three — they coexist):
+
+```bash
+# ViT-H full (55.8 AP, 13.5 FPS) — highest quality
+PYTHONIOENCODING=utf-8 python scripts/export_hf_backbone.py \
+    --image x.jpg --imgsz 1008
+
+# ViT-H Pruned-16 (53.6 AP, 19.1 FPS) — best quality/speed tradeoff
+PYTHONIOENCODING=utf-8 python scripts/export_hf_backbone.py \
+    --image x.jpg --imgsz 1008 \
+    --pruned-checkpoint distilled/pruned_16blocks.pt \
+    --output-engine hf_pruned16_fp16.engine
+
+# RepViT-M2.3 (38.7 AP, 30.2 FPS) — fastest with usable quality
+PYTHONIOENCODING=utf-8 python scripts/export_student_trt.py \
+    --models repvit_m2_3
+```
+
+### Step 3: Run detection
+
+```bash
+# ViT-H full
+python demo_multiclass.py --image x.jpg --classes person car bicycle dog \
+    --trt hf_backbone_1008_fp16.engine --trt-enc-dec enc_dec_fp16.engine \
+    --checkpoint sam3.pt --fast --detection-only -o x_annotated.jpg
+
+# ViT-H Pruned-16
+python demo_multiclass.py --image x.jpg --classes person car bicycle dog \
+    --trt hf_pruned16_fp16.engine --trt-enc-dec enc_dec_fp16.engine \
+    --checkpoint sam3.pt --fast --detection-only -o x_annotated.jpg
+
+# RepViT-M2.3
+python demo_multiclass.py --image x.jpg --classes person car bicycle dog \
+    --trt student_repvit_m2_3_fp16.engine --trt-enc-dec enc_dec_fp16.engine \
+    --checkpoint sam3.pt --fast --detection-only -o x_annotated.jpg
+```
+
+All three use the same `--trt-enc-dec` engine — only swap `--trt` to switch
+backbones. No retraining or adapter flags needed; the TRT engine IS the
+backbone.
+
+### Without TRT (PyTorch only)
 
 ```bash
 python demo_multiclass.py \
@@ -85,32 +141,13 @@ python demo_multiclass.py \
     --fast --detection-only
 ```
 
-The checkpoint auto-downloads from HuggingFace on the first run (~1.7 GB).
-
-### Full TRT pipeline (fastest)
+### 80-class COCO setup
 
 ```bash
-# 1. Build TRT engines (one-time, ~5 min)
-PYTHONIOENCODING=utf-8 python scripts/export_hf_backbone.py --image x.jpg --imgsz 1008
-
-python -m sam3.trt.export_enc_dec --checkpoint sam3.pt \
-    --output enc_dec.onnx --max-classes 4 --imgsz 1008
-python -m sam3.trt.build_engine --onnx enc_dec.onnx \
-    --output enc_dec_fp16.engine --fp16 --mixed-precision none
-
-# 2. Run detection
-python demo_multiclass.py --image x.jpg --classes person car bicycle dog \
-    --trt hf_backbone_1008_fp16.engine --trt-enc-dec enc_dec_fp16.engine \
-    --checkpoint sam3.pt --fast --detection-only -o x_annotated.jpg
-```
-
-### One-command COCO 80-class setup
-
-```bash
-# Builds enc-dec engine + caches text embeddings for all 80 COCO classes
+# Build enc-dec engine + text cache for all 80 classes
 python scripts/build_coco_engine.py --checkpoint sam3.pt
 
-# Run video with all 80 classes
+# Run video
 python demo_video.py --video input.mp4 --coco \
     --checkpoint sam3.pt \
     --trt hf_backbone_1008_fp16.engine \
@@ -147,6 +184,7 @@ python demo_multiclass.py --image x.jpg --classes person car bicycle dog \
 # Compare all inference modes
 python demo_multiclass.py --benchmark --classes person car bicycle dog
 ```
+
 
 ### Key flags
 
